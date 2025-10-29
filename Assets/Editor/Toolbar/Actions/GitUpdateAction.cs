@@ -26,7 +26,7 @@ namespace Toolbar
                 var summary = new StringBuilder();
 
                 scope.Update("暂存本地改动 (stash)", 0.15f);
-                if (!ExecuteGitCommand("stash -u -m \"UnityToolbarAuto\"", repoPath, out var out1, out var err1))
+                if (!ExecuteGitCommand("stash -u -m \"unityGitTool\"", repoPath, out var out1, out var err1))
                     return;
                 stashed = true;
                 if (!string.IsNullOrEmpty(out1)) summary.AppendLine($"stash 输出:\n{out1}");
@@ -324,7 +324,7 @@ namespace Toolbar
         {
             var unityDir = Directory.GetParent(Application.dataPath).FullName;
             var projectDir = Directory.GetParent(unityDir).FullName;
-            return projectDir;
+            return "D:\\OtherItem\\unityGitTool\\unityGitTool";
         }
     }
 }
