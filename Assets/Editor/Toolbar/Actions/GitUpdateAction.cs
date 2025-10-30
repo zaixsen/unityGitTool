@@ -4,17 +4,21 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using UnityEngine;
+using UnityEditor;
 
 namespace Toolbar
 {
     public class GitUpdateAction : ToolbarActionBase
     {
         private bool _clientOpened = false;
+        private const int InitTimeoutMs = 20000; // 初始化阶段命令的超时时间（毫秒）
         protected override string ButtonName => "GitUpdateAction";
 
         protected override string ButtonText => "Git更新";
 
         protected override string ButtonTooltip => "Git 更新：\n更新时会暂存本地修改，若有冲突，请使用本地的Git工具进行冲突合并";
+
+        protected override bool DefaultVisible => false;
 
         public override void Execute()
         {
@@ -26,7 +30,7 @@ namespace Toolbar
                 var summary = new StringBuilder();
 
                 scope.Update("暂存本地改动 (stash)", 0.15f);
-                if (!ExecuteGitCommand("stash -u -m \"unityGitTool\"", repoPath, out var out1, out var err1))
+                if (!ExecuteGitCommand("stash -u -m \"UnityToolbarAuto\"", repoPath, out var out1, out var err1, InitTimeoutMs))
                     return;
                 stashed = true;
                 if (!string.IsNullOrEmpty(out1)) summary.AppendLine($"stash 输出:\n{out1}");
@@ -56,20 +60,43 @@ namespace Toolbar
                 scope.Update("应用 stash (stash pop)", 0.85f);
                 if (!ExecuteGitCommand("stash pop", repoPath, out var out3, out var err3))
                 {
+                    // 出错时尝试恢复本地改动
                     ExecuteGitCommand("stash apply", repoPath, out var outApply2, out var errApply2);
                     scope.Update("stash pop 失败，已尝试 apply 恢复", 0.9f);
-                    ShowInfo("Git 命令错误提示", "stash pop 失败，已尝试 stash apply 恢复本地改动（stash 未删除）。");
+
+                    // 结合 Git 输出生成更完整的冲突提示
+                    var errMsg = !string.IsNullOrEmpty(err3) ? err3 : out3;
+                    var guidance = GetConflictGuidance("stash pop", errMsg);
+                    var sb = new StringBuilder();
+                    sb.AppendLine("stash pop 失败，已尝试 stash apply 恢复本地改动（stash 未删除）。");
+                    if (!string.IsNullOrEmpty(errMsg))
+                    {
+                        sb.AppendLine();
+                        sb.AppendLine("错误输出:");
+                        sb.AppendLine(errMsg);
+                    }
+                    if (!string.IsNullOrEmpty(guidance))
+                    {
+                        sb.AppendLine();
+                        sb.AppendLine("建议处理:");
+                        sb.AppendLine(guidance);
+                        TryOpenLocalGitClient(repoPath);
+                    }
+                    ShowInfo("Git 命令错误提示", sb.ToString());
                     return;
                 }
                 if (!string.IsNullOrEmpty(out3)) summary.AppendLine($"stash pop 输出:\n{out3}");
                 if (!string.IsNullOrEmpty(err3)) summary.AppendLine($"stash pop 警告:\n{err3}");
 
                 scope.Update("更新完成", 1f);
-                ShowInfo("Git 更新完成", summary.ToString());
+                if (!string.IsNullOrEmpty(summary.ToString()))
+                {
+                    UnityEngine.Debug.Log("[GitUpdateAction] 更新完成摘要:\n" + summary);
+                }
             }
         }
 
-        private bool ExecuteGitCommand(string command, string workingDirectory, out string output, out string error)
+        private bool ExecuteGitCommand(string command, string workingDirectory, out string output, out string error, int timeoutMs = 0)
         {
             var processInfo = new ProcessStartInfo
             {
@@ -86,10 +113,33 @@ namespace Toolbar
             {
                 process.StartInfo = processInfo;
                 process.Start();
-                output = process.StandardOutput.ReadToEnd();
-                error = process.StandardError.ReadToEnd();
+                if (timeoutMs > 0)
+                {
+                    var exited = process.WaitForExit(timeoutMs);
+                    if (!exited)
+                    {
+                        try { process.Kill(); } catch { }
+                        // 确保进程已退出
+                        try { process.WaitForExit(2000); } catch { }
 
-                process.WaitForExit();
+                        output = string.Empty;
+                        error = $"命令超时({timeoutMs} ms): {command}";
+
+                        var composedTimeout = $"命令: {command}\n错误: {error}\n\n建议处理:\n请检查网络或仓库状态，稍后重试。";
+                        EditorUtility.DisplayDialog("Git 更新失败", "Git 命令超时，请检查网络或仓库状态。", "确定");
+                        ShowInfo("Git 命令错误提示", composedTimeout);
+                        return false;
+                    }
+
+                    output = process.StandardOutput.ReadToEnd();
+                    error = process.StandardError.ReadToEnd();
+                }
+                else
+                {
+                    output = process.StandardOutput.ReadToEnd();
+                    error = process.StandardError.ReadToEnd();
+                    process.WaitForExit();
+                }
                 var exitCode = process.ExitCode;
 
                 if (exitCode != 0)
@@ -104,6 +154,7 @@ namespace Toolbar
                     if (!string.IsNullOrEmpty(guidance))
                     {
                         TryOpenLocalGitClient(workingDirectory);
+                        EditorUtility.DisplayDialog("Git 更新冲突", "检测到拉取/变基过程中的冲突，请按指引处理。", "好的");
                     }
 
                     if (!isStashPop)
@@ -128,7 +179,18 @@ namespace Toolbar
             var isRebasePull = command.StartsWith("pull") && command.Contains("--rebase");
             var isStashPop = command.Contains("stash pop");
 
-            bool hasConflictHints = text.Contains("conflict") || text.Contains("merge conflict") || text.Contains("could not apply") || text.Contains("rebase");
+            // 扩展冲突识别，兼容中文提示与常见报错语句
+            bool hasConflictHints =
+                text.Contains("conflict") ||
+                text.Contains("merge conflict") ||
+                text.Contains("could not apply") ||
+                text.Contains("rebase") ||
+                text.Contains("overwritten") ||
+                text.Contains("failed to merge") ||
+                (msg ?? string.Empty).Contains("冲突") ||
+                (msg ?? string.Empty).Contains("合并冲突") ||
+                (msg ?? string.Empty).Contains("无法应用") ||
+                (msg ?? string.Empty).Contains("拒绝");
 
             if (isRebasePull && hasConflictHints)
             {
@@ -322,9 +384,32 @@ namespace Toolbar
 
         private string GetRepoPath()
         {
-            var unityDir = Directory.GetParent(Application.dataPath).FullName;
-            var projectDir = Directory.GetParent(unityDir).FullName;
-            return "D:\\OtherItem\\unityGitTool\\unityGitTool";
+            try
+            {
+                var startDir = Directory.GetParent(Application.dataPath)?.FullName;
+                var current = startDir;
+                while (!string.IsNullOrEmpty(current))
+                {
+                    var dotGitPath = Path.Combine(current, ".git");
+                    if (Directory.Exists(dotGitPath) || File.Exists(dotGitPath))
+                    {
+                        return current;
+                    }
+
+                    var parent = Directory.GetParent(current);
+                    if (parent == null) break;
+                    current = parent.FullName;
+                }
+
+                var unityDir = startDir ?? Directory.GetParent(Application.dataPath).FullName;
+                var projectDir = Directory.GetParent(unityDir)?.FullName ?? unityDir;
+                return projectDir ?? unityDir;
+            }
+            catch
+            {
+                var unityDir = Directory.GetParent(Application.dataPath).FullName;
+                return unityDir;
+            }
         }
     }
 }
